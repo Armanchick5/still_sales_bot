@@ -1,0 +1,13 @@
+# Telegram-бот на Aiogram 3.x
+aiogram==3.20.0
+
+# Асинхронная работа с PostgreSQL
+SQLAlchemy[asyncio]==1.4.46
+asyncpg==0.27.0
+
+# HTTP-клиент и HTML-парсер (aiohttp ≥3.9 для aiogram)
+aiohttp>=3.9.0,<3.12
+beautifulsoup4==4.12.2
+
+# Работа с .env
+python-dotenv==0.21.0

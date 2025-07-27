@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    container_name: standup_db
+    restart: always
+    env_file:
+      - .env.local        # файл с переменными POSTGRES_*
+    ports:
+      - "5742:5432"       # внешний порт 5742 → внутренний 5432
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: standup_bot
+    restart: always
+    env_file:
+      - .env.local        # подтягиваем те же переменные, плюс BOT_TOKEN
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:
