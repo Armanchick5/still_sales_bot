@@ -11,7 +11,7 @@ from standup_ticket_bot.models.concert import SourceEnum
 router = Router()
 
 SOURCE_ICONS: dict[SourceEnum, str] = {
-    SourceEnum.YANDEX: "®Яндекс",
+    SourceEnum.YANDEX: "Яндекс",
     SourceEnum.GOSTANDUP: "GOSTANDUP",
     SourceEnum.TIMEPAD: "Timepad",
 }
