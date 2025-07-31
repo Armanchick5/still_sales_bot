@@ -160,57 +160,76 @@ if not (TIMEPAD_BEARER and TIMEPAD_ORG_ID):
     raise RuntimeError("TIMEPAD_BEARER_TOKEN и/или TIMEPAD_ORG_ID не заданы в .env")
 
 
-async def fetch_registration(s: aiohttp.ClientSession, event_id: str) -> dict:
-    """Возвращает dict с полями registered, limit, capacity."""
+async def fetch_registration(session: aiohttp.ClientSession, event_id: str) -> dict:
+    """
+    Тянем статистику из раздела registration,
+    где лежат поля registered, limit, capacity.
+    """
     url = f"{TIMEPAD_API_URL}/events/{event_id}.json"
     params = {"fields": "registration"}
-    async with s.get(url, headers={"Authorization": f"Bearer {TIMEPAD_BEARER}"}, params=params) as r:
+    async with session.get(
+            url,
+            headers={"Authorization": f"Bearer {TIMEPAD_BEARER}"},
+            params=params
+    ) as r:
         r.raise_for_status()
         data = await r.json()
+
     places = data.get("registration", {}).get("places", [])
     if isinstance(places, list):
         return places[0] if places else {}
     return places
 
 
-async def parse_timepad() -> list[dict]:
+async def parse_timepad() -> List[dict]:
     """
-    Всегда берём свежую статистику из registration.*,
-    поскольку там корректные registered / limit (capacity).
-    Если limit отсутствует (0 или None) – считаем, что мероприятие без лимита.
+    Парсим события с Timepad. Сначала пытаемся взять
+    sold/total из ticket_types, если их нет ― из registration.
     """
     url = f"{TIMEPAD_API_URL}/events.json"
     headers = {"Authorization": f"Bearer {TIMEPAD_BEARER}"}
     params = {
         "organization_ids": TIMEPAD_ORG_ID,
-        "fields": "dates,starts_at",  # ticket_types не нужны
+        "fields": "dates,starts_at,ticket_types",
         "limit": 100,
         "skip": 0,
         "sort": "+starts_at",
     }
 
-    items: list[dict] = []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    items: List[dict] = []
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, headers=headers, params=params) as r:
             r.raise_for_status()
             data = await r.json()
 
         for ev in data.get("values", []):
-            ext_id = str(ev["id"])
+            ext_id = str(ev.get("id", ""))
             name = (ev.get("name") or ev.get("title") or "").strip()
 
-            # дата
-            raw_date = ev.get("starts_at")
+            # Определяем дату
+            raw = None
             if ev.get("dates"):
-                raw_date = ev["dates"][0].get("start") or ev["dates"][0].get("date")
-            if not raw_date:
+                raw = ev["dates"][0].get("start") or ev["dates"][0].get("date")
+            if not raw:
+                raw = ev.get("starts_at")
+            if not raw:
                 continue
-            dt = date_parser.parse(raw_date).astimezone(timezone.utc).replace(tzinfo=None)
 
-            # REGISTRATION  ────────────────────────────────────────────
-            reg = await fetch_registration(session, ext_id)
-            sold = reg.get("registered") or reg.get("count") or 0
-            total = reg.get("limit") or reg.get("capacity") or 0  # 0 → безлимит
+            dt = date_parser.parse(raw)
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+            # Сначала пробуем ticket_types
+            ticket_types = ev.get("ticket_types", [])
+            if ticket_types:
+                sold = sum(tt.get("sold", 0) for tt in ticket_types)
+                total = sum(tt.get("total", tt.get("count", 0)) for tt in ticket_types)
+            else:
+                # fallback на registration
+                reg = await fetch_registration(session, ext_id)
+                sold = reg.get("registered", 0) or reg.get("count", 0)
+                total = reg.get("limit", 0) or reg.get("capacity", 0)
 
             items.append({
                 "external_id": ext_id,
@@ -221,4 +240,5 @@ async def parse_timepad() -> list[dict]:
                 "url": ev.get("url") or ev.get("site_url") or f"{TIMEPAD_API_URL}/events/{ext_id}",
                 "source": SourceEnum.TIMEPAD,
             })
+
     return items
