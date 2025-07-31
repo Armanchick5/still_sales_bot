@@ -11,7 +11,7 @@ from standup_ticket_bot.models.concert import SourceEnum
 router = Router()
 
 SOURCE_ICONS: dict[SourceEnum, str] = {
-    SourceEnum.YANDEX: "Яндекс",
+    SourceEnum.YANDEX: "®Яндекс",
     SourceEnum.GOSTANDUP: "GOSTANDUP",
     SourceEnum.TIMEPAD: "Timepad",
 }
@@ -34,7 +34,9 @@ async def _send_concerts(message: Message, concerts: list, title: str) -> None:
 
     for ev in concerts:
         icon = SOURCE_ICONS.get(ev.source, ev.source.name)
-        dt_str = ev.date.strftime("%Y-%m-%d %H:%M")
+        # Переводим UTC время в московское (UTC+3)
+        dt_local = ev.date + timedelta(hours=3)
+        dt_str = dt_local.strftime("%Y-%m-%d %H:%M")
 
         # Вычисляем оставшиеся дни и процент продаж
         now = datetime.utcnow()
