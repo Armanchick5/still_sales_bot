@@ -27,113 +27,94 @@ YANDEX_CITY_ID = int(os.getenv("YANDEX_CITY_ID", "34348482"))
 
 
 def _yandex_auth() -> str:
-    """LOGIN:sha1(md5(PASSWORD) + TS):TS (оба хэша в upper-case)."""
+    """LOGIN:sha1(md5(PASSWORD)+TS):TS  — всё в uppercase."""
     if not (YANDEX_LOGIN and YANDEX_PASSWORD):
-        raise RuntimeError("YANDEX_API_LOGIN / PASSWORD not set in .env")
+        raise RuntimeError("YANDEX_API_LOGIN / PASSWORD отсутствуют в .env")
+
     ts = str(int(time.time()))
-    md5 = hashlib.md5(YANDEX_PASSWORD.encode()).hexdigest().upper()
-    sha1 = hashlib.sha1(f"{md5}{ts}".encode()).hexdigest().upper()
+    pwd_md5 = hashlib.md5(YANDEX_PASSWORD.encode()).hexdigest().upper()
+    sha1 = hashlib.sha1(f"{pwd_md5}{ts}".encode()).hexdigest().upper()
     return f"{YANDEX_LOGIN}:{sha1}:{ts}"
 
 
 async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
-    """Универсальный GET-запрос к CRM-API."""
-    params = {
+    params: Dict[str, Any] = {
         "action": action,
         "auth": _yandex_auth(),
+        "city_id": YANDEX_CITY_ID,
         "format": "json",
-        "city_id": YANDEX_CITY_ID,  # без него API вернёт «City ID is not received»
         **extra,
     }
     url = YANDEX_API_URL.rstrip("/") + "/"
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, params=params, ssl=False) as r:
-            raw = await r.text()
-    data = json.loads(raw)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
+            raw = await resp.text()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Yandex вернул не-JSON ({resp.status}): {raw[:150]}")
     if data.get("status") != "0":
         raise RuntimeError(f"Yandex API error {action}: {data}")
     return data
 
 
-def _flatten(obj: Any) -> List[Any]:
-    """crm.*.list иногда отдаёт вложенные списки — расплющиваем."""
-    if isinstance(obj, list):
-        out: List[Any] = []
-        for item in obj:
-            out.extend(_flatten(item))
-        return out
-    return [obj]
+def _flatten(lst: Any) -> List[Any]:
+    """crm.*.list иногда отдаёт список списков – расплющиваем."""
+    flat: List[Any] = []
+    for item in lst:
+        flat.extend(item if isinstance(item, list) else [item])
+    return flat
 
 
-async def _yandex_places() -> List[int]:
-    """Получаем все place_id организации (большой, малый залы и т.д.)."""
-    resp = await _yandex_call("crm.place.list")
-    return [p["id"] for p in _flatten(resp.get("result", []))]
-
-
-async def _yandex_events(activity_ids: list[int]) -> list[dict]:
-    """Возвращает все сеансы (events) по списку activity_id."""
-    events: list[dict] = []
-    for aid in activity_ids:
-        resp = await _yandex_call("crm.event.list", activity_id=aid)
-        events.extend(_flatten(resp.get("result", [])))
-    return events
-
-
-async def parse_yandex() -> list[dict]:
-    """Возвращает ВСЕ сеансы Яндекс.Билетов + статистику продаж."""
-    # 1. Собираем все activity по place_id
-    activities: list[dict] = []
-    for pid in await _yandex_places():
-        resp = await _yandex_call("crm.activity.list", place_id=pid)
-        activities.extend(_flatten(resp.get("result", [])))
-
-    if not activities:
-        return []
-
-    # 2. Собираем все events (сеансы) по этим activity
-    activity_ids = [a["id"] for a in activities]
-    events_raw = await _yandex_events(activity_ids)
-
+async def parse_yandex() -> List[dict]:
+    """Возвращает только будущие события из Яндекс Афиши с данными по билетам."""
+    # 1. Сеансы (events)
+    ev_resp = await _yandex_call("crm.event.list")
+    events_raw = _flatten(ev_resp.get("result", []))
     if not events_raw:
         return []
 
-    # 3. Отчёт по билетам уже для event-ID
-    event_ids = ",".join(str(e["id"]) for e in events_raw)
-    rep = await _yandex_call("crm.report.event", event_ids=event_ids)
-    stats = {str(r["event_id"]): r for r in rep.get("result", [])}
+    # 2. Отчет по билетам
+    ids = ",".join(str(e["id"]) for e in events_raw)
+    rep_resp = await _yandex_call("crm.report.event", event_ids=ids)
 
-    # 4. Финальная сборка
-    out: list[dict] = []
+    # собираем корректную статистику по каждому event_id
+    stats: Dict[str, dict] = {}
+    for row in rep_resp.get("result", []):
+        eid = str(row["event_id"])
+        sold = row.get("tickets_sold", 0)
+        avail = row.get("tickets_available", 0)
+        total = sold + avail
+
+        s = stats.setdefault(eid, {"sold": 0, "total": 0})
+        s["sold"] += sold
+        s["total"] += total
+
+    # 3. Формируем итоговый список, фильтруя прошедшие
+    items: List[dict] = []
+    now = datetime.utcnow()
     for ev in events_raw:
         eid = str(ev["id"])
-        st = stats.get(eid, {})
-        sold = st.get("tickets_sold", 0)
-        total = (
-                st.get("tickets_count")
-                or st.get("tickets_available", 0)
-                or sold
-        )
+        name = ev.get("name", "").strip()
+        dt = date_parser.parse(ev.get("date", "")).astimezone(timezone.utc).replace(tzinfo=None)
+        # Отброс прошедших событий
+        if dt < now:
+            continue
 
-        dt = (
-            date_parser.parse(ev["date"])
-            .astimezone(timezone.utc)
-            .replace(tzinfo=None)
-        )
+        st = stats.get(eid, {"sold": 0, "total": 0})
+        sold = st["sold"]
+        tickets_total = st["total"]
 
-        out.append(
-            {
-                "external_id": eid,  # теперь event-ID
-                "name": ev["name"].strip(),
-                "date": dt,
-                "tickets_sold": sold,
-                "tickets_total": total,
-                "url": f"https://afisha.yandex.ru/events/{eid}",
-                "source": SourceEnum.YANDEX,
-            }
-        )
-
-    return out
+        items.append({
+            "external_id": eid,
+            "name": name,
+            "date": dt,
+            "tickets_sold": sold,
+            "tickets_total": tickets_total,
+            "url": f"https://afisha.yandex.ru/events/{eid}",
+            "source": SourceEnum.YANDEX,
+        })
+    return items
 
 
 # -------------------------------------------------------------------
