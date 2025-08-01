@@ -27,66 +27,79 @@ YANDEX_CITY_ID = int(os.getenv("YANDEX_CITY_ID", "34348482"))
 
 
 def _yandex_auth() -> str:
-    if YANDEX_LOGIN is None or YANDEX_PASSWORD is None:
-        raise RuntimeError("YANDEX_API_LOGIN / PASSWORD are not set in .env")
+    """LOGIN:sha1(md5(PASSWORD) + TS):TS (оба хэша в upper-case)."""
+    if not (YANDEX_LOGIN and YANDEX_PASSWORD):
+        raise RuntimeError("YANDEX_API_LOGIN / PASSWORD not set in .env")
     ts = str(int(time.time()))
-    pwd_md5 = hashlib.md5(YANDEX_PASSWORD.encode()).hexdigest().upper()
-    sha1 = hashlib.sha1(f"{pwd_md5}{ts}".encode()).hexdigest().upper()
+    md5 = hashlib.md5(YANDEX_PASSWORD.encode()).hexdigest().upper()
+    sha1 = hashlib.sha1(f"{md5}{ts}".encode()).hexdigest().upper()
     return f"{YANDEX_LOGIN}:{sha1}:{ts}"
 
 
 async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
-    params: Dict[str, Any] = {
+    """Универсальный GET-запрос к CRM-API."""
+    params = {
         "action": action,
         "auth": _yandex_auth(),
         "format": "json",
+        "city_id": YANDEX_CITY_ID,  # без него API вернёт «City ID is not received»
         **extra,
     }
-    params["city_id"] = YANDEX_CITY_ID
     url = YANDEX_API_URL.rstrip("/") + "/"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params, ssl=False) as resp:
-            raw = await resp.text()
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, params=params, ssl=False) as r:
+            raw = await r.text()
     data = json.loads(raw)
     if data.get("status") != "0":
         raise RuntimeError(f"Yandex API error {action}: {data}")
     return data
 
 
-def _flatten(lst: Any) -> List[Any]:
-    flat: List[Any] = []
-    for item in lst:
-        if isinstance(item, list):
-            flat.extend(item)
-        else:
-            flat.append(item)
-    return flat
+def _flatten(obj: Any) -> List[Any]:
+    """crm.*.list иногда отдаёт вложенные списки — расплющиваем."""
+    if isinstance(obj, list):
+        out: List[Any] = []
+        for item in obj:
+            out.extend(_flatten(item))
+        return out
+    return [obj]
+
+
+async def _yandex_places() -> List[int]:
+    """Получаем все place_id организации (большой, малый залы и т.д.)."""
+    resp = await _yandex_call("crm.place.list")
+    return [p["id"] for p in _flatten(resp.get("result", []))]
 
 
 async def parse_yandex() -> List[dict]:
-    # Используем crm.activity.list для полного списка мероприятий
-    resp = await _yandex_call("crm.activity.list")
-    activities = resp.get("result", [])
+    """Возвращает мероприятия со всех залов + статистику продаж."""
+    # 1. Собираем все мероприятия по каждому place_id
+    activities: List[dict] = []
+    for pid in await _yandex_places():
+        resp = await _yandex_call("crm.activity.list", place_id=pid)
+        activities.extend(_flatten(resp.get("result", [])))
+
     if not activities:
         return []
 
-    # Собираем статистику по событиям
-    ids = ",".join(str(act["id"]) for act in activities)
+    # 2. Отчёт по билетам
+    ids = ",".join(str(a["id"]) for a in activities)
     rep = await _yandex_call("crm.report.event", event_ids=ids)
-    stats: Dict[str, dict] = {str(r["event_id"]): r for r in rep.get("result", [])}
+    stats = {str(r["event_id"]): r for r in rep.get("result", [])}
 
+    # 3. Формируем итоговый список
     events: List[dict] = []
     for act in activities:
         eid = str(act["id"])
         st = stats.get(eid, {})
         sold = st.get("tickets_sold", 0)
         total = st.get("tickets_count") or st.get("tickets_available", 0) or sold
-        # event_date содержит дату и время
-        dt = date_parser.parse(act.get("event_date")).astimezone(timezone.utc).replace(tzinfo=None)
+
+        dt = date_parser.parse(act["event_date"]).astimezone(timezone.utc).replace(tzinfo=None)
 
         events.append({
             "external_id": eid,
-            "name": act.get("name", "").strip(),
+            "name": act["name"].strip(),
             "date": dt,
             "tickets_sold": sold,
             "tickets_total": total,
@@ -167,10 +180,13 @@ async def parse_timepad() -> List[dict]:
             dt = dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
             tt = ev.get("ticket_types", [])
             if tt:
-                sold = sum(t.get("sold", 0) for t in tt); total = sum(t.get("total", t.get("count", 0)) for t in tt)
+                sold = sum(t.get("sold", 0) for t in tt);
+                total = sum(t.get("total", t.get("count", 0)) for t in tt)
             else:
-                reg = await fetch_registration(session, ext); sold = reg.get("registered", 0) or reg.get("count",
-                                                                                                         0); total = reg.get(
+                reg = await fetch_registration(session, ext);
+                sold = reg.get("registered", 0) or reg.get("count",
+                                                           0);
+                total = reg.get(
                     "limit", 0) or reg.get("capacity", 0)
             items.append({"external_id": ext, "name": name, "date": dt, "tickets_sold": sold, "tickets_total": total,
                           "url": ev.get("url") or ev.get("site_url") or f"{TIMEPAD_API_URL}/events/{ext}",
