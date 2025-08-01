@@ -32,21 +32,31 @@ def _yandex_auth() -> str:
 
 
 async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
+    """Low‑level wrapper around CRM‑API.
+
+    * **GET** request (the only allowed method)
+    * All parameters (action, auth, city_id, format, etc.) are sent **ONLY**
+      in the query string; body must be empty.
+    * Response is JSON with mandatory ``status`` field.
+    """
     params: Dict[str, Any] = {
-        "action": action,
+        "action": action,  # e.g. crm.activity.list
         "auth": _yandex_auth(),
-        "city_id": YANDEX_CITY_ID,
         "format": "json",
         **extra,
     }
+
     url = YANDEX_API_URL.rstrip("/") + "/"
+
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as resp:
+        async with session.get(url, params=params, ssl=False) as resp:
             raw = await resp.text()
+
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"Yandex вернул не-JSON ({resp.status}): {raw[:150]}")
+    except ValueError:
+        raise RuntimeError(f"Yandex returned non‑JSON ({resp.status}): {raw[:150]}…")
+
     if data.get("status") != "0":
         raise RuntimeError(f"Yandex API error {action}: {data}")
     return data
