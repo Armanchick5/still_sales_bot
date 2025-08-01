@@ -42,21 +42,13 @@ def _yandex_auth() -> str:
 
 
 async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
-    """Low-level wrapper around CRM-API.
-
-    * **GET** request (the only allowed method)
-    * All parameters (action, auth, city_id, format, etc.) are sent **ONLY**
-      in the query string; body must be empty.
-    * Response is JSON with mandatory ``status`` field.
-    """
     params: Dict[str, Any] = {
         "action": action,
         "auth": _yandex_auth(),
         "format": "json",
         **extra,
     }
-    # фильтруем по городу, без этого API выдаёт ошибку
-    params["city_id"] = YANDEX_CITY_ID
+    # params["city_id"] = YANDEX_CITY_ID
 
     url = YANDEX_API_URL.rstrip("/") + "/"
     async with aiohttp.ClientSession() as session:
