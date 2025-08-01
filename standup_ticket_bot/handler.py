@@ -34,8 +34,12 @@ async def _send_concerts(message: Message, concerts: list, title: str) -> None:
 
     for ev in concerts:
         icon = SOURCE_ICONS.get(ev.source, ev.source.name)
-        # Переводим UTC время в московское (UTC+3)
-        dt_local = ev.date + timedelta(hours=3)
+
+        # Локализуем время: только для Timepad добавляем +3 часа
+        if ev.source == SourceEnum.TIMEPAD:
+            dt_local = ev.date + timedelta(hours=3)
+        else:
+            dt_local = ev.date
         dt_str = dt_local.strftime("%Y-%m-%d %H:%M")
 
         # Вычисляем оставшиеся дни и процент продаж
