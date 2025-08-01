@@ -71,10 +71,19 @@ async def _yandex_places() -> List[int]:
     return [p["id"] for p in _flatten(resp.get("result", []))]
 
 
-async def parse_yandex() -> List[dict]:
-    """Возвращает мероприятия со всех залов + статистику продаж."""
-    # 1. Собираем все мероприятия по каждому place_id
-    activities: List[dict] = []
+async def _yandex_events(activity_ids: list[int]) -> list[dict]:
+    """Возвращает все сеансы (events) по списку activity_id."""
+    events: list[dict] = []
+    for aid in activity_ids:
+        resp = await _yandex_call("crm.event.list", activity_id=aid)
+        events.extend(_flatten(resp.get("result", [])))
+    return events
+
+
+async def parse_yandex() -> list[dict]:
+    """Возвращает ВСЕ сеансы Яндекс.Билетов + статистику продаж."""
+    # 1. Собираем все activity по place_id
+    activities: list[dict] = []
     for pid in await _yandex_places():
         resp = await _yandex_call("crm.activity.list", place_id=pid)
         activities.extend(_flatten(resp.get("result", [])))
@@ -82,31 +91,49 @@ async def parse_yandex() -> List[dict]:
     if not activities:
         return []
 
-    # 2. Отчёт по билетам
-    ids = ",".join(str(a["id"]) for a in activities)
-    rep = await _yandex_call("crm.report.event", event_ids=ids)
+    # 2. Собираем все events (сеансы) по этим activity
+    activity_ids = [a["id"] for a in activities]
+    events_raw = await _yandex_events(activity_ids)
+
+    if not events_raw:
+        return []
+
+    # 3. Отчёт по билетам уже для event-ID
+    event_ids = ",".join(str(e["id"]) for e in events_raw)
+    rep = await _yandex_call("crm.report.event", event_ids=event_ids)
     stats = {str(r["event_id"]): r for r in rep.get("result", [])}
 
-    # 3. Формируем итоговый список
-    events: List[dict] = []
-    for act in activities:
-        eid = str(act["id"])
+    # 4. Финальная сборка
+    out: list[dict] = []
+    for ev in events_raw:
+        eid = str(ev["id"])
         st = stats.get(eid, {})
         sold = st.get("tickets_sold", 0)
-        total = st.get("tickets_count") or st.get("tickets_available", 0) or sold
+        total = (
+                st.get("tickets_count")
+                or st.get("tickets_available", 0)
+                or sold
+        )
 
-        dt = date_parser.parse(act["event_date"]).astimezone(timezone.utc).replace(tzinfo=None)
+        dt = (
+            date_parser.parse(ev["date"])
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None)
+        )
 
-        events.append({
-            "external_id": eid,
-            "name": act["name"].strip(),
-            "date": dt,
-            "tickets_sold": sold,
-            "tickets_total": total,
-            "url": f"https://afisha.yandex.ru/events/{eid}",
-            "source": SourceEnum.YANDEX,
-        })
-    return events
+        out.append(
+            {
+                "external_id": eid,  # теперь event-ID
+                "name": ev["name"].strip(),
+                "date": dt,
+                "tickets_sold": sold,
+                "tickets_total": total,
+                "url": f"https://afisha.yandex.ru/events/{eid}",
+                "source": SourceEnum.YANDEX,
+            }
+        )
+
+    return out
 
 
 # -------------------------------------------------------------------
