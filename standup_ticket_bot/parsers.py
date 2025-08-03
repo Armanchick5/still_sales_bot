@@ -1,40 +1,64 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone, date
+"""Parsers for Yandex Afisha (CRM), GoStandUp, and Timepad.
+
+Все функции асинхронные и возвращают список словарей одинаковой структуры:
+    {
+        "external_id": str,
+        "name": str,
+        "date": datetime,               # naive-UTC
+        "tickets_sold": int,
+        "tickets_total": int,
+        "url": str,
+        "source": SourceEnum,
+    }
+
+Изменения относительно предыдущей ревизии:
+    • Исправлена генерация `auth` для API Яндекс.Билетов: теперь MD5/SHA‑1
+      хэши передаются **в нижнем регистре**, как того требует документация
+      (иначе API отвечало `Incorrect login or password`).
+    • Функция `_parse_dt()` нормализует строки даты в naive‑UTC.
+    • ClientSession теперь переиспользуется через _session().
+    • Мелкие оптимизации (itertools.chain, фильтр status≠1).
+"""
+
+from datetime import datetime, timezone
 from typing import List, Any, Dict
-import time, hashlib, aiohttp, json
-from urllib.parse import urlencode
+import time
+import hashlib
+import json
+import itertools
+import aiohttp
+import os
 
 from dateutil import parser as date_parser
-import itertools
-
-from standup_ticket_bot.models.concert import SourceEnum
 from dotenv import load_dotenv
 
+from standup_ticket_bot.models.concert import SourceEnum
+
 load_dotenv()
-import os
 
 # ╔═══════════════════════════════════════════════════════════════════════╗
 # ║                         YANDEX AFISHA (CRM)                           ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
-YANDEX_API_URL = os.getenv(
-    "YANDEX_API_URL",
-    "https://api.tickets.yandex.net/api/crm/"
-)
-
+YANDEX_API_URL = os.getenv("YANDEX_API_URL", "https://api.tickets.yandex.net/api/crm/")
 YANDEX_LOGIN = os.getenv("YANDEX_API_LOGIN")
 YANDEX_PASSWORD = os.getenv("YANDEX_API_PASSWORD")
 YANDEX_CITY_ID = int(os.getenv("YANDEX_CITY_ID", "34348482"))
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _yandex_auth() -> str:
-    """Builds auth string ``LOGIN:sha1(md5(PASSWORD)+TS):TS`` (uppercase)."""
+    """Builds auth string ``LOGIN:sha1(md5(PASSWORD)+TS):TS`` (lower‑case hex)."""
     if not (YANDEX_LOGIN and YANDEX_PASSWORD):
         raise RuntimeError("YANDEX_API_LOGIN / PASSWORD отсутствуют в .env")
 
     ts = str(int(time.time()))
-    pwd_md5 = hashlib.md5(YANDEX_PASSWORD.encode()).hexdigest().upper()
-    sha1 = hashlib.sha1(f"{pwd_md5}{ts}".encode()).hexdigest().upper()
+    pwd_md5 = hashlib.md5(YANDEX_PASSWORD.encode()).hexdigest()  # LOWER‑case
+    sha1 = hashlib.sha1(f"{pwd_md5}{ts}".encode()).hexdigest()  # LOWER‑case
     return f"{YANDEX_LOGIN}:{sha1}:{ts}"
 
 
@@ -50,7 +74,7 @@ def _session() -> aiohttp.ClientSession:
 
 
 async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
-    """Low‑level wrapper around Yandex CRM API."""
+    """Low-level wrapper around Yandex CRM API."""
     params: Dict[str, Any] = {
         "action": action,
         "auth": _yandex_auth(),
@@ -65,7 +89,7 @@ async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
     try:
         data: Dict[str, Any] = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Yandex вернул не‑JSON ({resp.status}): {raw[:150]}") from exc
+        raise RuntimeError(f"Yandex вернул не-JSON ({resp.status}): {raw[:150]}") from exc
 
     if data.get("status") != "0":
         raise RuntimeError(f"Yandex API error {action}: {data}")
@@ -78,9 +102,9 @@ def _flatten(lst: List[Any]) -> List[Any]:
 
 
 def _parse_dt(raw: str) -> datetime:
-    """Return **naive‑UTC** datetime from API date string.
+    """Return **naive-UTC** datetime from API date string.
 
-    Yandex returns ``YYYY‑MM‑DD HH:MM:SS`` (no tz). If someday it starts adding
+    Yandex returns ``YYYY-MM-DD HH:MM:SS`` (no tz). If someday it starts adding
     a TZ offset, we still convert to UTC and drop tzinfo to keep comparisons
     with ``datetime.utcnow()`` safe.
     """
