@@ -6,6 +6,7 @@ import time, hashlib, aiohttp, json
 from urllib.parse import urlencode
 
 from dateutil import parser as date_parser
+import itertools
 
 from standup_ticket_bot.models.concert import SourceEnum
 from dotenv import load_dotenv
@@ -27,7 +28,7 @@ YANDEX_CITY_ID = int(os.getenv("YANDEX_CITY_ID", "34348482"))
 
 
 def _yandex_auth() -> str:
-    """LOGIN:sha1(md5(PASSWORD)+TS):TS  — всё в uppercase."""
+    """Builds auth string ``LOGIN:sha1(md5(PASSWORD)+TS):TS`` (uppercase)."""
     if not (YANDEX_LOGIN and YANDEX_PASSWORD):
         raise RuntimeError("YANDEX_API_LOGIN / PASSWORD отсутствуют в .env")
 
@@ -37,7 +38,19 @@ def _yandex_auth() -> str:
     return f"{YANDEX_LOGIN}:{sha1}:{ts}"
 
 
+a_sync_session: aiohttp.ClientSession | None = None
+
+
+def _session() -> aiohttp.ClientSession:
+    """Single shared ClientSession (lazy)."""
+    global a_sync_session
+    if a_sync_session is None or a_sync_session.closed:
+        a_sync_session = aiohttp.ClientSession()
+    return a_sync_session
+
+
 async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
+    """Low‑level wrapper around Yandex CRM API."""
     params: Dict[str, Any] = {
         "action": action,
         "auth": _yandex_auth(),
@@ -46,39 +59,55 @@ async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
         **extra,
     }
     url = YANDEX_API_URL.rstrip("/") + "/"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as resp:
-            raw = await resp.text()
+    async with _session().get(url, params=params) as resp:
+        raw = await resp.text()
+
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"Yandex вернул не-JSON ({resp.status}): {raw[:150]}")
+        data: Dict[str, Any] = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Yandex вернул не‑JSON ({resp.status}): {raw[:150]}") from exc
+
     if data.get("status") != "0":
         raise RuntimeError(f"Yandex API error {action}: {data}")
     return data
 
 
-def _flatten(lst: Any) -> List[Any]:
+def _flatten(lst: List[Any]) -> List[Any]:
     """crm.*.list иногда отдаёт список списков – расплющиваем."""
-    flat: List[Any] = []
-    for item in lst:
-        flat.extend(item if isinstance(item, list) else [item])
-    return flat
+    return list(itertools.chain.from_iterable((i if isinstance(i, list) else [i]) for i in lst))
 
+
+def _parse_dt(raw: str) -> datetime:
+    """Return **naive‑UTC** datetime from API date string.
+
+    Yandex returns ``YYYY‑MM‑DD HH:MM:SS`` (no tz). If someday it starts adding
+    a TZ offset, we still convert to UTC and drop tzinfo to keep comparisons
+    with ``datetime.utcnow()`` safe.
+    """
+    dt = date_parser.parse(raw) if raw else datetime.min
+    if dt.tzinfo:  # aware → normalize to UTC
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=None)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 async def parse_yandex() -> List[dict]:
-    """Возвращает только будущие события из Яндекс Афиши с данными по билетам."""
+    """Return future Yandex Afisha events with ticket stats."""
+
     # 1. Сеансы (events)
     ev_resp = await _yandex_call("crm.event.list")
     events_raw = _flatten(ev_resp.get("result", []))
     if not events_raw:
         return []
 
-    # 2. Отчет по билетам
+    # 2. Отчёт по билетам (batched by IDs)
     ids = ",".join(str(e["id"]) for e in events_raw)
     rep_resp = await _yandex_call("crm.report.event", event_ids=ids)
 
-    # собираем корректную статистику по каждому event_id
+    # 2.1. Собираем статистику по каждому event_id
     stats: Dict[str, dict] = {}
     for row in rep_resp.get("result", []):
         eid = str(row["event_id"])
@@ -93,27 +122,30 @@ async def parse_yandex() -> List[dict]:
     # 3. Формируем итоговый список, фильтруя прошедшие
     items: List[dict] = []
     now = datetime.utcnow()
+
     for ev in events_raw:
+        if ev.get("status") != 1:  # пропускаем закрытые сеансы
+            continue
+
         eid = str(ev["id"])
         name = ev.get("name", "").strip()
-        dt = date_parser.parse(ev.get("date", "")).astimezone(timezone.utc).replace(tzinfo=None)
+        dt = _parse_dt(ev.get("date", ""))
+
         # Отброс прошедших событий
         if dt < now:
             continue
 
         st = stats.get(eid, {"sold": 0, "total": 0})
-        sold = st["sold"]
-        tickets_total = st["total"]
-
         items.append({
             "external_id": eid,
             "name": name,
             "date": dt,
-            "tickets_sold": sold,
-            "tickets_total": tickets_total,
+            "tickets_sold": st["sold"],
+            "tickets_total": st["total"],
             "url": f"https://afisha.yandex.ru/events/{eid}",
             "source": SourceEnum.YANDEX,
         })
+
     return items
 
 
