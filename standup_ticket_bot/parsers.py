@@ -2,24 +2,16 @@ from __future__ import annotations
 
 """Parsers for Yandex Afisha (CRM), GoStandUp, and Timepad.
 
-Все функции асинхронные и возвращают список словарей одинаковой структуры:
-    {
-        "external_id": str,
-        "name": str,
-        "date": datetime,               # naive-UTC
-        "tickets_sold": int,
-        "tickets_total": int,
-        "url": str,
-        "source": SourceEnum,
-    }
-
-Изменения относительно предыдущей ревизии:
-    • Исправлена генерация `auth` для API Яндекс.Билетов: теперь MD5/SHA‑1
-      хэши передаются **в нижнем регистре**, как того требует документация
-      (иначе API отвечало `Incorrect login or password`).
-    • Функция `_parse_dt()` нормализует строки даты в naive‑UTC.
-    • ClientSession теперь переиспользуется через _session().
-    • Мелкие оптимизации (itertools.chain, фильтр status≠1).
+Функции возвращают список словарей единого формата:
+{
+    "external_id": str,
+    "name": str,
+    "date": datetime,        # naive-UTC
+    "tickets_sold": int,
+    "tickets_total": int,
+    "url": str,
+    "source": SourceEnum,
+}
 """
 
 from datetime import datetime, timezone
@@ -52,29 +44,27 @@ YANDEX_CITY_ID = int(os.getenv("YANDEX_CITY_ID", "34348482"))
 # ---------------------------------------------------------------------------
 
 def _yandex_auth() -> str:
-    """Builds auth string ``LOGIN:sha1(md5(PASSWORD)+TS):TS`` (lower‑case hex)."""
+    """LOGIN:sha1(md5(PASSWORD)+TS):TS — все в нижнем регистре (hex)."""
     if not (YANDEX_LOGIN and YANDEX_PASSWORD):
         raise RuntimeError("YANDEX_API_LOGIN / PASSWORD отсутствуют в .env")
 
     ts = str(int(time.time()))
-    pwd_md5 = hashlib.md5(YANDEX_PASSWORD.encode()).hexdigest()  # LOWER‑case
-    sha1 = hashlib.sha1(f"{pwd_md5}{ts}".encode()).hexdigest()  # LOWER‑case
+    pwd_md5 = hashlib.md5(YANDEX_PASSWORD.encode()).hexdigest()  # lower
+    sha1 = hashlib.sha1(f"{pwd_md5}{ts}".encode()).hexdigest()  # lower
     return f"{YANDEX_LOGIN}:{sha1}:{ts}"
 
 
-a_sync_session: aiohttp.ClientSession | None = None
+_aio_session: aiohttp.ClientSession | None = None
 
 
 def _session() -> aiohttp.ClientSession:
-    """Single shared ClientSession (lazy)."""
-    global a_sync_session
-    if a_sync_session is None or a_sync_session.closed:
-        a_sync_session = aiohttp.ClientSession()
-    return a_sync_session
+    global _aio_session
+    if _aio_session is None or _aio_session.closed:
+        _aio_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    return _aio_session
 
 
 async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
-    """Low-level wrapper around Yandex CRM API."""
     params: Dict[str, Any] = {
         "action": action,
         "auth": _yandex_auth(),
@@ -97,41 +87,33 @@ async def _yandex_call(action: str, **extra: Any) -> Dict[str, Any]:
 
 
 def _flatten(lst: List[Any]) -> List[Any]:
-    """crm.*.list иногда отдаёт список списков – расплющиваем."""
+    """crm.*.list иногда отдаёт список списков — расплющиваем."""
     return list(itertools.chain.from_iterable((i if isinstance(i, list) else [i]) for i in lst))
 
 
 def _parse_dt(raw: str) -> datetime:
-    """Return **naive-UTC** datetime from API date string.
-
-    Yandex returns ``YYYY-MM-DD HH:MM:SS`` (no tz). If someday it starts adding
-    a TZ offset, we still convert to UTC and drop tzinfo to keep comparisons
-    with ``datetime.utcnow()`` safe.
-    """
+    """Вернёт naive‑UTC datetime из строковой даты API."""
     dt = date_parser.parse(raw) if raw else datetime.min
-    if dt.tzinfo:  # aware → normalize to UTC
+    if dt.tzinfo:
         dt = dt.astimezone(timezone.utc)
     return dt.replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Yandex
 # ---------------------------------------------------------------------------
 
 async def parse_yandex() -> List[dict]:
-    """Return future Yandex Afisha events with ticket stats."""
-
-    # 1. Сеансы (events)
+    """Возвращает будущие события Яндекс.Афиши с корректной статистикой билетов."""
     ev_resp = await _yandex_call("crm.event.list")
     events_raw = _flatten(ev_resp.get("result", []))
     if not events_raw:
         return []
 
-    # 2. Отчёт по билетам (batched by IDs)
     ids = ",".join(str(e["id"]) for e in events_raw)
     rep_resp = await _yandex_call("crm.report.event", event_ids=ids)
 
-    # 2.1. Собираем статистику по каждому event_id
+    # Суммируем по event_id (на случай, если отчёт вернёт несколько строк).
     stats: Dict[str, dict] = {}
     for row in rep_resp.get("result", []):
         eid = str(row["event_id"])
@@ -143,19 +125,18 @@ async def parse_yandex() -> List[dict]:
         s["sold"] += sold
         s["total"] += total
 
-    # 3. Формируем итоговый список, фильтруя прошедшие
     items: List[dict] = []
     now = datetime.utcnow()
 
     for ev in events_raw:
-        if ev.get("status") != 1:  # пропускаем закрытые сеансы
+        # status==1 — активные/публикуемые сеансы
+        if ev.get("status") != 1:
             continue
 
         eid = str(ev["id"])
-        name = ev.get("name", "").strip()
+        name = (ev.get("name") or "").strip()
         dt = _parse_dt(ev.get("date", ""))
 
-        # Отброс прошедших событий
         if dt < now:
             continue
 
@@ -176,31 +157,37 @@ async def parse_yandex() -> List[dict]:
 # -------------------------------------------------------------------
 # GoStandUp
 # -------------------------------------------------------------------
+
 GOSTANDUP_API_URL = os.getenv("GOSTANDUP_API_URL", "https://gostandup.ru/api/org")
 GOSTANDUP_BEARER = os.getenv("GOSTANDUP_BEARER_TOKEN")
-if not GOSTANDUP_BEARER: raise RuntimeError("GOSTANDUP_BEARER_TOKEN not set in .env")
+if not GOSTANDUP_BEARER:
+    raise RuntimeError("GOSTANDUP_BEARER_TOKEN not set in .env")
 
 
 async def parse_gostandup() -> List[dict]:
     headers = {"Authorization": f"Bearer {GOSTANDUP_BEARER}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(GOSTANDUP_API_URL, headers=headers) as resp:
-            resp.raise_for_status();
-            data = await resp.json()
+    async with _session().get(GOSTANDUP_API_URL, headers=headers) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+
     items: List[dict] = []
     for ev in data.get("events", []):
-        t = ev.get("tickets", {});
-        seats = t.get("seats", {});
-        amt = t.get("amount", {})
-        sold = seats.get("sold") if seats.get("total") else amt.get("sold", 0)
-        total = seats.get("total") or amt.get("total", 0)
+        t = ev.get("tickets", {}) or {}
+        seats = t.get("seats", {}) or {}
+        amt = t.get("amount", {}) or {}
+
+        # 🔧 Главное исправление: суммируем оба источника.
+        sold = (seats.get("sold") or 0) + (amt.get("sold") or 0)
+        total = (seats.get("total") or 0) + (amt.get("total") or 0)
+
         items.append({
             "external_id": str(ev["id"]),
-            "name": ev.get("title", "").strip(),
-            "date": date_parser.parse(ev.get("date", "")),
-            "tickets_sold": sold, "tickets_total": total,
-            "url": ev.get("link") or f"https://gostandup.ru/event/{ev['id']}",
-            "source": SourceEnum.GOSTANDUP
+            "name": (ev.get("title") or "").strip(),
+            "date": _parse_dt(ev.get("date", "")),
+            "tickets_sold": sold,
+            "tickets_total": total,
+            "url": ev.get("link") or ev.get("url") or f"https://gostandup.ru/event/{ev['id']}",
+            "source": SourceEnum.GOSTANDUP,
         })
     return items
 
@@ -208,51 +195,70 @@ async def parse_gostandup() -> List[dict]:
 # -------------------------------------------------------------------
 # Timepad
 # -------------------------------------------------------------------
+
 TIMEPAD_API_URL = os.getenv("TIMEPAD_API_URL", "https://api.timepad.ru/v1")
 TIMEPAD_BEARER = os.getenv("TIMEPAD_BEARER_TOKEN")
 TIMEPAD_ORG_ID = os.getenv("TIMEPAD_ORG_ID")
-if not (TIMEPAD_BEARER and TIMEPAD_ORG_ID): raise RuntimeError("TIMEPAD creds missing")
+if not (TIMEPAD_BEARER and TIMEPAD_ORG_ID):
+    raise RuntimeError("TIMEPAD creds missing")
 
 
 async def fetch_registration(session: aiohttp.ClientSession, event_id: str) -> dict:
-    url = f"{TIMEPAD_API_URL}/events/{event_id}.json";
+    url = f"{TIMEPAD_API_URL}/events/{event_id}.json"
     params = {"fields": "registration"}
     async with session.get(url, headers={"Authorization": f"Bearer {TIMEPAD_BEARER}"}, params=params) as resp:
-        resp.raise_for_status();
+        resp.raise_for_status()
         data = await resp.json()
     places = data.get("registration", {}).get("places", [])
     return places[0] if isinstance(places, list) and places else places or {}
 
 
 async def parse_timepad() -> List[dict]:
-    url = f"{TIMEPAD_API_URL}/events.json";
+    url = f"{TIMEPAD_API_URL}/events.json"
     headers = {"Authorization": f"Bearer {TIMEPAD_BEARER}"}
-    params = {"organization_ids": TIMEPAD_ORG_ID, "fields": "dates,starts_at,ticket_types", "limit": 100, "skip": 0,
-              "sort": "+starts_at"}
+    params = {
+        "organization_ids": TIMEPAD_ORG_ID,
+        "fields": "dates,starts_at,ticket_types",
+        "limit": 100,
+        "skip": 0,
+        "sort": "+starts_at",
+    }
+
     items: List[dict] = []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-        async with session.get(url, headers=headers, params=params) as resp:
-            resp.raise_for_status();
-            data = await resp.json()
-        for ev in data.get("values", []):
-            ext = str(ev.get("id"));
-            name = (ev.get("name") or ev.get("title") or "").strip()
-            ds = ev.get("dates");
-            raw = ds and (ds[0].get("start") or ds[0].get("date")) or ev.get("starts_at")
-            if not raw: continue
-            dt = date_parser.parse(raw);
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
-            tt = ev.get("ticket_types", [])
-            if tt:
-                sold = sum(t.get("sold", 0) for t in tt);
-                total = sum(t.get("total", t.get("count", 0)) for t in tt)
-            else:
-                reg = await fetch_registration(session, ext);
-                sold = reg.get("registered", 0) or reg.get("count",
-                                                           0);
-                total = reg.get(
-                    "limit", 0) or reg.get("capacity", 0)
-            items.append({"external_id": ext, "name": name, "date": dt, "tickets_sold": sold, "tickets_total": total,
-                          "url": ev.get("url") or ev.get("site_url") or f"{TIMEPAD_API_URL}/events/{ext}",
-                          "source": SourceEnum.TIMEPAD})
+    session = _session()
+
+    async with session.get(url, headers=headers, params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+
+    for ev in data.get("values", []):
+        ext = str(ev.get("id"))
+        name = (ev.get("name") or ev.get("title") or "").strip()
+
+        ds = ev.get("dates")
+        raw = (ds and (ds[0].get("start") or ds[0].get("date"))) or ev.get("starts_at")
+        if not raw:
+            continue
+
+        dt = _parse_dt(raw)
+
+        tt = ev.get("ticket_types", []) or []
+        if tt:
+            sold = sum((t.get("sold") or 0) for t in tt)
+            total = sum((t.get("total") or t.get("count") or 0) for t in tt)
+        else:
+            reg = await fetch_registration(session, ext)
+            sold = reg.get("registered", 0) or reg.get("count", 0)
+            total = reg.get("limit", 0) or reg.get("capacity", 0)
+
+        items.append({
+            "external_id": ext,
+            "name": name,
+            "date": dt,
+            "tickets_sold": sold,
+            "tickets_total": total,
+            "url": ev.get("url") or ev.get("site_url") or f"{TIMEPAD_API_URL}/events/{ext}",
+            "source": SourceEnum.TIMEPAD,
+        })
+
     return items
